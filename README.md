@@ -1,7 +1,7 @@
 # SCL-90-R analysis scripts
 
 This repository contains analysis scripts to reproduce results reported in:
-**[Your manuscript title here]**
+**[Profile-Specific SCL-90-R Symptom Networks in Chinese University Students: Out-of-Sample Validation in Three Annual Cohorts (2022–2024)]**
 
 ## Data
 The dataset is publicly available at openICPSR:
@@ -14,8 +14,8 @@ https://doi.org/10.3886/E230221V1
 
 ## How to reproduce
 ### Software
-- R version: [e.g., 4.4.0]
-- Key packages: [e.g., tidyverse, mclust, qgraph, bootnet, NetworkComparisonTest]
+- R version: 4.5.1
+- Key packages: [ data.table ; dplyr; mclust; lavaan; semTools; qgraph; bootnet]
 
 ### Steps
 1. Download data from openICPSR and place it in `data/` (not tracked by Git).
@@ -28,5 +28,4 @@ https://doi.org/10.3886/E230221V1
    - `06_tables_figures.R`
 3. Outputs will be written to `outputs/`.
 
-## Notes
-- Update file paths in `scripts/config.R` (if provided) before running.
+
