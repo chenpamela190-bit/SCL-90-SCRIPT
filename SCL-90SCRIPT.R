@@ -10,6 +10,7 @@
 # ===================================================================
 
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
 # STEP 0: INSTALL PACKAGES & LOAD LIBRARIES
 # -------------------------------------------------------------------
 # install.packages(c(
@@ -147,76 +148,102 @@ data_with_domains[domain_cols] <- lapply(
 
 
 # -------------------------------------------------------------------
-# STEP 3: ADDRESS REVIEWER POINT #2 (QC Pipeline & Distributions)
-# -------------------------------------------------------------------
-cat("STEP 3: Running QC Pipeline (Reviewer Point 2)...\n")
+# STEP 3: 
 
-# Helper for long-string
+# ---- Helper: max consecutive identical responses (ignores NA runs) ----
 get_max_consecutive <- function(x) {
+  x <- as.numeric(x)
   if (length(x) == 0) return(0)
   rle_x <- rle(x)
   lengths_without_na <- rle_x$lengths[!is.na(rle_x$values)]
   if (length(lengths_without_na) == 0) 0 else max(lengths_without_na)
 }
 
-# QC metrics on de-duplicated (earliest) data for all years
-qc_data <- data_deduped_primary %>%
-  rowwise() %>%
-  mutate(
+# ---- 3.0 Build QC metrics on RAW submissions (all years; all institutions) ----
+# Add a stable row_id so slice_min/slice_max works deterministically
+qc_all <- data_with_domains %>%
+  dplyr::mutate(row_id = dplyr::row_number()) %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
     time_taken_minutes = time_taken / 60,
     long_string        = get_max_consecutive(c_across(all_of(all_item_cols))),
     response_variance  = sd(c_across(all_of(all_item_cols)), na.rm = TRUE)
   ) %>%
-  ungroup() %>%
-  as.data.frame()
+  dplyr::ungroup()
 
-# Force domain cols to be atomic numeric
-qc_data[domain_cols] <- lapply(
-  qc_data[domain_cols],
-  function(z) as.numeric(unlist(z))
+# Ensure domain columns are atomic numeric (prevents list-columns surprises)
+qc_all[domain_cols] <- lapply(qc_all[domain_cols], function(z) as.numeric(unlist(z)))
+
+# ---- 3.1 Build a robust attempt_order for de-duplication ----
+# If a real timestamp column exists, use it; otherwise fall back to row_id.
+timestamp_candidates <- c(
+  "submission_timestamp", "submission_time", "submit_time",
+  "timestamp", "submitted_at", "created_at"
 )
+ts_col <- intersect(timestamp_candidates, names(qc_all))
+ts_col <- if (length(ts_col) > 0) ts_col[1] else NA_character_
 
-# QC flags  (long-string threshold = 20)
-cat("Adding QC flags to 'qc_data' object for later steps...\n")
-qc_data <- qc_data %>%
-  mutate(
-    flag_speeder    = ifelse(is.na(time_taken_minutes), FALSE, time_taken_minutes < 5),
-    flag_longstring = ifelse(is.na(long_string),        FALSE, long_string >= 20),
-    flag_zerovar    = ifelse(is.na(response_variance),  FALSE, response_variance < 0.10),
+qc_all$attempt_order <- qc_all$row_id
+if (!is.na(ts_col)) {
+  tmp_ts <- suppressWarnings(as.numeric(qc_all[[ts_col]]))
+  qc_all$attempt_order <- ifelse(is.na(tmp_ts), qc_all$row_id, tmp_ts)
+}
+
+# ---- 3.2 QC flags (Long-string >= 20, SD < 0.10, Speeder < 5 min) ----
+# IMPORTANT: Speeder is applied ONLY for 2019–2021 (as per your manuscript).
+speeder_years <- c("2019", "2020", "2021")
+
+cat("Adding QC flags...\n")
+qc_all <- qc_all %>%
+  dplyr::mutate(
+    flag_speeder    = dplyr::if_else(
+      Year %in% speeder_years & !is.na(time_taken_minutes),
+      time_taken_minutes < 5,
+      FALSE
+    ),
+    flag_longstring = dplyr::if_else(is.na(long_string),       FALSE, long_string >= 20),
+    flag_zerovar    = dplyr::if_else(is.na(response_variance), FALSE, response_variance < 0.10),
     flag_any        = flag_speeder | flag_longstring | flag_zerovar
   )
-cat("'qc_data' object is now ready.\n")
+cat("'qc_all' object is now ready.\n")
 
-# Plots for Revised Figure S1 (based on qc_data, all years)
+# -------------------------------------------------------------------
+# 3.3 Revised Figure S1 (distributions)
+#   - Panel A (time): only 2019–2021 because speeder was not used later
+#   - Panels B/C: all years OK
+# -------------------------------------------------------------------
 cat("Generating plots for Revised Figure S1...\n")
 
-plot_time <- ggplot(qc_data, aes(x = time_taken_minutes)) +
+qc_time_only <- qc_all %>%
+  dplyr::filter(Year %in% speeder_years, !is.na(time_taken_minutes))
+
+plot_time <- ggplot(qc_time_only, aes(x = time_taken_minutes)) +
   geom_histogram(binwidth = 1, fill = "#0072B2", alpha = 0.7) +
   geom_vline(xintercept = 5, color = "red", linetype = "dashed", linewidth = 1) +
   annotate("text", x = 7, y = 500, label = "Threshold (5 min)", color = "red",
            angle = 90, vjust = -0.5) +
-  labs(title = "A: Distribution of Completion Times",
+  labs(title = "A: Completion Time Distribution (2019–2021 only)",
        x = "Time (Minutes)", y = "Count") +
   theme_bw() +
   scale_x_continuous(limits = c(0, 60), breaks = seq(0, 60, 10))
 
-plot_longstring <- ggplot(qc_data, aes(x = long_string)) +
+plot_longstring <- ggplot(qc_all, aes(x = long_string)) +
   geom_histogram(binwidth = 1, fill = "#D55E00", alpha = 0.7) +
   geom_vline(xintercept = 20, color = "red", linetype = "dashed", linewidth = 1) +
   annotate("text", x = 21, y = 1000, label = "Threshold (>= 20)", color = "red",
            angle = 90, vjust = -0.5) +
-  labs(title = "B: Distribution of Long-String Responses",
-       x = "Max. Consecutive Identical Answers", y = "Count") +
+  labs(title = "B: Long-String Distribution (All years)",
+       x = "Max. consecutive identical answers", y = "Count") +
   theme_bw() +
   scale_x_continuous(limits = c(0, 90), breaks = seq(0, 90, 10))
 
-plot_variance <- ggplot(qc_data, aes(x = response_variance)) +
+plot_variance <- ggplot(qc_all, aes(x = response_variance)) +
   geom_histogram(binwidth = 0.02, fill = "#009E73", alpha = 0.7) +
   geom_vline(xintercept = 0.10, color = "red", linetype = "dashed", linewidth = 1) +
   annotate("text", x = 0.12, y = 500, label = "Threshold (< 0.10)", color = "red",
            angle = 90, vjust = -0.5) +
-  labs(title = "C: Distribution of Response Variance (SD)",
-       x = "Standard Deviation of 90 Items", y = "Count") +
+  labs(title = "C: Response SD Distribution (All years)",
+       x = "SD of 90 items", y = "Count") +
   theme_bw() +
   scale_x_continuous(limits = c(0, 2))
 
@@ -224,67 +251,125 @@ revised_figure_s1 <- plot_time + plot_longstring + plot_variance
 print(revised_figure_s1)
 # ggsave("Revised_Figure_S1.png", revised_figure_s1, width = 14, height = 5)
 
-# QC filters for final CONFIRMATORY samples (raw university data 2022–2024)
-raw_uni_data <- data_with_domains %>%
-  filter(Study_Level == "University", Year %in% c("2022", "2023", "2024"))
-
-raw_uni_qc <- raw_uni_data %>%
-  rowwise() %>%
-  mutate(
-    time_taken_minutes = time_taken / 60,
-    long_string        = get_max_consecutive(c_across(all_of(all_item_cols))),
-    response_variance  = sd(c_across(all_of(all_item_cols)), na.rm = TRUE)
-  ) %>%
-  ungroup()
-
-qc_flags_raw <- raw_uni_qc %>%
-  mutate(
-    flag_speeder    = ifelse(is.na(time_taken_minutes), FALSE, time_taken_minutes < 5),
-    flag_longstring = ifelse(is.na(long_string),        FALSE, long_string >= 20),
-    flag_zerovar    = ifelse(is.na(response_variance),  FALSE, response_variance < 0.10),
-    flag_any        = flag_speeder | flag_longstring | flag_zerovar
-  )
-
+# -------------------------------------------------------------------
+# 3.4 REVISED TABLE S2 (QC exclusions, raw university submissions 2022–2024)
+# -------------------------------------------------------------------
 cat("\n--- Generating REVISED TABLE S2 (QC Exclusions, University 2022–2024) ---\n")
+
+qc_flags_raw <- qc_all %>%
+  dplyr::filter(Study_Level == "University", Year %in% c("2022","2023","2024"))
+
 qc_table_s2 <- qc_flags_raw %>%
-  group_by(Year) %>%
-  summarise(
-    N_raw                   = n(),
-    Flag_Speeder            = sum(flag_speeder,    na.rm = TRUE),
-    Flag_LongString         = sum(flag_longstring, na.rm = TRUE),
-    Flag_ZeroVar            = sum(flag_zerovar,    na.rm = TRUE),
-    Total_QC_Flagged_Unique = sum(flag_any,        na.rm = TRUE),
-    .groups                 = "drop"
-  ) %>%
-  mutate(Remaining_after_QC = N_raw - Total_QC_Flagged_Unique)
+  dplyr::group_by(Year) %>%
+  dplyr::summarise(
+    N_raw            = dplyr::n(),
+    Flag_Speeder     = sum(flag_speeder,    na.rm = TRUE),   # should be 0 by design here
+    Flag_LongString  = sum(flag_longstring, na.rm = TRUE),
+    Flag_ZeroVar     = sum(flag_zerovar,    na.rm = TRUE),
+    Total_QC_Flagged = sum(flag_any,        na.rm = TRUE),
+    N_after_QC       = N_raw - Total_QC_Flagged,
+    .groups          = "drop"
+  )
 
 print(qc_table_s2)
 
-# Final analytic samples (earliest vs latest, post-QC)
-passed_qc_ids <- qc_flags_raw %>%
-  filter(!flag_any) %>%
-  select(ID, Year)
+# Optional (recommended): show how many UNIQUE IDs remain after QC (before dedup)
+qc_after_counts <- qc_flags_raw %>%
+  dplyr::filter(!flag_any) %>%
+  dplyr::group_by(Year) %>%
+  dplyr::summarise(
+    N_after_QC_submissions = dplyr::n(),
+    Unique_IDs_after_QC    = dplyr::n_distinct(ID),
+    .groups = "drop"
+  )
+cat("\nQC-passing submissions vs unique IDs (before dedup):\n")
+print(qc_after_counts)
 
-final_sample <- data_with_domains %>%
-  inner_join(passed_qc_ids, by = c("ID", "Year")) %>%
-  group_by(Year, ID) %>%
-  slice_head(n = 1) %>%
-  ungroup() %>%
+# -------------------------------------------------------------------
+# 3.5 FINAL analytic samples (post-QC, then dedup earliest vs latest)
+#     ✅ This is the key fix: dedup is done AFTER QC using attempt_order.
+# -------------------------------------------------------------------
+passed_qc <- qc_flags_raw %>%
+  dplyr::filter(!flag_any)
+
+# Earliest QC-passing submission per (Year, ID)
+final_sample <- passed_qc %>%
+  dplyr::group_by(Year, ID) %>%
+  dplyr::slice_min(order_by = attempt_order, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
   as.data.frame()
 
-cat("\nFinal Analytic Sample (earliest) created.\n")
+cat("\nFinal Analytic Sample (earliest QC-passing) created.\n")
 print(table(final_sample$Year))
 
-final_sample_LATEST <- data_with_domains %>%
-  inner_join(passed_qc_ids, by = c("ID", "Year")) %>%
-  group_by(Year, ID) %>%
-  slice_tail(n = 1) %>%
-  ungroup() %>%
+# Latest QC-passing submission per (Year, ID) — sensitivity
+final_sample_LATEST <- passed_qc %>%
+  dplyr::group_by(Year, ID) %>%
+  dplyr::slice_max(order_by = attempt_order, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
   as.data.frame()
 
-cat("\nFinal Sensitivity Sample (latest) created.\n")
+cat("\nFinal Sensitivity Sample (latest QC-passing) created.\n")
 print(table(final_sample_LATEST$Year))
+
+# If you still need the ID list for joins later (kept for compatibility)
+passed_qc_ids <- passed_qc %>%
+  dplyr::distinct(ID, Year)
+
+# -------------------------------------------------------------------
+# 3.6 Create qc_data (QC-passed + de-duplicated) for ALL YEARS
+#     (used later for your Table S1 “Training/Discovery” counts)
+# -------------------------------------------------------------------
+qc_data <- qc_all %>%
+  dplyr::filter(!flag_any) %>%
+  dplyr::group_by(Year, ID) %>%
+  dplyr::slice_min(order_by = attempt_order, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  as.data.frame()
+
+# Ensure domain cols numeric again (safe)
+qc_data[domain_cols] <- lapply(qc_data[domain_cols], function(z) as.numeric(unlist(z)))
+
 cat("STEP 3: Complete.\n\n")
+
+
+# ===================================================================
+# STEP 3.7: TRAIN MODEL & ASSIGN PROFILES (The Missing Link)
+# ===================================================================
+cat("\n--- STEP 3.5: Assigning Profiles ---\n")
+
+# 1. We need the training data (2019-2021) to build the model
+training_data_uni_only <- qc_data %>%
+  filter(Year %in% c("2019", "2020", "2021"), Study_Level == "University") %>%
+  select(all_of(domain_cols)) %>%
+  na.omit()
+
+# 2. Train the LPA Model (VVV, 2 profiles)
+cat("Training LPA Model on 2019-2021 data...\n")
+set.seed(123)
+model_uni_only <- Mclust(as.matrix(training_data_uni_only), G=2, modelNames="VVV")
+
+# 3. Predict Profiles for the Final Sample (2022-2024)
+#    This adds the "Profile" column you were missing!
+newdata_primary <- final_sample[, domain_cols]
+pred_primary <- predict(model_uni_only, newdata = as.matrix(newdata_primary))
+
+final_sample$Profile <- as.integer(pred_primary$classification)
+
+cat("SUCCESS: Profile column added. Table of Year vs Profile:\n")
+print(table(final_sample$Year, final_sample$Profile))
+
+# 4. NOW create the dataset for Analysis
+FINAL_ANALYSIS_DATASET <- final_sample %>%
+  dplyr::select(Year, Profile, dplyr::all_of(domain_cols)) %>%
+  tidyr::drop_na(dplyr::all_of(domain_cols)) %>%
+  as.data.frame()
+
+# Ensure Profile is integer
+FINAL_ANALYSIS_DATASET$Profile <- as.integer(FINAL_ANALYSIS_DATASET$Profile)
+
+cat("\nFINAL_ANALYSIS_DATASET is ready. N =", nrow(FINAL_ANALYSIS_DATASET), "\n")
+# ===================================================================
 
 
 # -------------------------------------------------------------------
@@ -331,27 +416,181 @@ stats_C <- data_with_domains %>%
 cat("\nC. Confirmatory Sample (Raw 2022–2024):\n"); print(stats_C)
 
 # D. Confirmatory analytic sample (final QC-passed, de-duplicated, university-only)
-stats_D <- final_sample %>%
+# ----- CONSISTENT ANALYTIC OBJECT FOR DESCRIPTIVES -----
+analytic_univ <- final_sample %>%
+  dplyr::filter(Year %in% c("2022","2023","2024")) %>%
+  tidyr::drop_na(dplyr::all_of(domain_cols))   # match downstream analyses
+
+# Check AGE missingness by year
+age_missing_check <- analytic_univ %>%
+  group_by(Year) %>%
+  summarise(
+    N_total          = n(),
+    N_age_nonmissing = sum(!is.na(AGE)),
+    N_age_missing    = sum(is.na(AGE)),
+    .groups = "drop"
+  )
+print(age_missing_check)
+
+# Year-specific AGE (non-missing only)
+age_by_year <- analytic_univ %>%
+  filter(!is.na(AGE)) %>%
+  group_by(Year) %>%
+  summarise(
+    N_age    = n(),
+    Mean_Age = mean(AGE),
+    SD_Age   = sd(AGE),
+    .groups  = "drop"
+  )
+print(age_by_year)
+
+# Pooled AGE across years where AGE exists
+age_pooled <- analytic_univ %>%
+  filter(!is.na(AGE)) %>%
+  summarise(
+    N_age    = n(),
+    Mean_Age = mean(AGE),
+    SD_Age   = sd(AGE)
+  )
+print(age_pooled)
+
+# Weighted mean check
+weighted_mean <- with(age_by_year, sum(N_age * Mean_Age) / sum(N_age))
+cat("Weighted pooled mean =", weighted_mean, "\n")
+
+
+# ----- D. Confirmatory Analytic Sample (University only, QC-passed, deduped, complete domains) -----
+stats_D <- analytic_univ %>%
   summarise(
     N          = n(),
+    Pct_Female = sum(GENDER == 2, na.rm = TRUE) / sum(!is.na(GENDER)),
+    # AGE pooled only for non-missing ages (will exclude 2024 automatically)
+    N_Age      = sum(!is.na(AGE)),
     Mean_Age   = mean(AGE, na.rm = TRUE),
-    SD_Age     = sd(AGE,   na.rm = TRUE),
-    Pct_Female = sum(GENDER == 2, na.rm = TRUE) / sum(!is.na(GENDER))
+    SD_Age     = sd(AGE,   na.rm = TRUE)
   )
-cat("\nD. Confirmatory Analytic Sample (University Only, post-QC):\n"); print(stats_D)
+print(stats_D)
 
-stats_D_years <- final_sample %>%
+stats_D_years <- analytic_univ %>%
   group_by(Year) %>%
   summarise(
     N          = n(),
+    Pct_Female = sum(GENDER == 2, na.rm = TRUE) / sum(!is.na(GENDER)),
+    N_Age      = sum(!is.na(AGE)),
     Mean_Age   = mean(AGE, na.rm = TRUE),
     SD_Age     = sd(AGE,   na.rm = TRUE),
-    Pct_Female = sum(GENDER == 2, na.rm = TRUE) / sum(!is.na(GENDER)),
     .groups    = "drop"
   )
-cat("\nD (Breakdown by Year):\n"); print(stats_D_years)
-cat("STEP 4: Complete.\n\n")
+print(stats_D_years)
 
+
+
+
+cat("\n--- DIAGNOSTIC: CHECKING AGE MEANS ---\n")
+
+# 1. Calculate the mean for 2022 only
+mean_2022 <- mean(analytic_univ$AGE[analytic_univ$Year == "2022"], na.rm = TRUE)
+
+# 2. Calculate the mean for 2023 only
+mean_2023 <- mean(analytic_univ$AGE[analytic_univ$Year == "2023"], na.rm = TRUE)
+
+# 3. Calculate the POOLED mean (The one the reviewer questioned)
+mean_total <- mean(analytic_univ$AGE, na.rm = TRUE)
+
+cat("Mean Age 2022: ", round(mean_2022, 2), "\n")
+cat("Mean Age 2023: ", round(mean_2023, 2), "\n")
+cat("Mean Age TOTAL:", round(mean_total, 2), "\n")
+
+# If 'Mean Age TOTAL' is 18.60, then the 18.62 in your supplement was a typo.
+# If 'Mean Age TOTAL' is 18.62, then your Table 2 in the main text was wrong.
+# -------------------------------------------------
+
+
+cat("\n--- ATTRITION / SELECTION BIAS CHECK (University, 2022–2024) ---\n")
+
+# 0) Make sure qc_flags_raw is EXACTLY the confirmatory university raw submissions
+#    (If you already created qc_flags_raw earlier exactly like this, you can skip this block.)
+qc_flags_raw <- qc_all %>%
+  dplyr::filter(Study_Level == "University", Year %in% c("2022","2023","2024")) %>%
+  dplyr::mutate(
+    flag_any = flag_speeder | flag_longstring | flag_zerovar
+  )
+
+# 1) Student-level status: included if any QC-passing attempt exists for that Year×ID
+id_status <- qc_flags_raw %>%
+  dplyr::group_by(Year, ID) %>%
+  dplyr::summarise(
+    included = any(!flag_any),      # TRUE = has at least one QC-passing submission
+    all_flagged = all(flag_any),    # TRUE = every submission flagged (redundant but nice)
+    # take first non-missing demographics available for that ID-year
+    GENDER = dplyr::first(na.omit(GENDER)),
+    AGE    = dplyr::first(na.omit(AGE)),
+    .groups = "drop"
+  )
+
+# 2) Sanity check: counts should align with your analytic Ns after QC+dedup
+count_check <- id_status %>%
+  dplyr::group_by(Year, included) %>%
+  dplyr::summarise(N = dplyr::n(), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = included, values_from = N, values_fill = 0) %>%
+  dplyr::rename(N_excluded_all_flagged = `FALSE`, N_included_any_pass = `TRUE`)
+
+print(count_check)
+
+cat("\nTotal (University 2022–2024):\n")
+cat("Included (any QC-pass) =", sum(id_status$included), "\n")
+cat("Excluded (all QC-flagged) =", sum(!id_status$included), "\n")
+
+# 3) AGE comparison (NOTE: this uses only cases with non-missing AGE)
+age_dat <- id_status %>% dplyr::filter(!is.na(AGE))
+
+age_n <- age_dat %>%
+  dplyr::group_by(included) %>%
+  dplyr::summarise(
+    N_age = dplyr::n(),
+    Mean  = mean(AGE),
+    SD    = sd(AGE),
+    .groups = "drop"
+  )
+print(age_n)
+
+t_test_age <- t.test(AGE ~ included, data = age_dat)
+print(t_test_age)
+
+# Cohen's d (approx; pooled SD)
+m1 <- mean(age_dat$AGE[age_dat$included], na.rm = TRUE)
+m0 <- mean(age_dat$AGE[!age_dat$included], na.rm = TRUE)
+sd1 <- sd(age_dat$AGE[age_dat$included], na.rm = TRUE)
+sd0 <- sd(age_dat$AGE[!age_dat$included], na.rm = TRUE)
+n1 <- sum(age_dat$included)
+n0 <- sum(!age_dat$included)
+sd_pooled <- sqrt(((n1-1)*sd1^2 + (n0-1)*sd0^2) / (n1+n0-2))
+d_cohen <- (m1 - m0) / sd_pooled
+cat("\nAge mean diff (Included - Excluded) =", round(m1 - m0, 3),
+    "; Cohen's d =", round(d_cohen, 3), "\n")
+
+# 4) SEX comparison (student-level)
+tab_sex <- table(id_status$included, id_status$GENDER)
+print(tab_sex)
+
+prop_sex <- prop.table(tab_sex, margin = 1)
+print("Row % (Included vs Excluded): 1=Male, 2=Female")
+print(round(prop_sex, 4))
+
+chisq_res <- chisq.test(tab_sex, correct = FALSE)  # no Yates correction
+print(chisq_res)
+
+# Cramer's V
+n_tot <- sum(tab_sex)
+chi2  <- unname(chisq_res$statistic)
+k     <- min(nrow(tab_sex) - 1, ncol(tab_sex) - 1)
+cramers_v <- sqrt(chi2 / (n_tot * k))
+cat("\nCramer's V =", round(cramers_v, 3), "\n")
+
+# Optional: % male among excluded vs included (easy to report)
+male_pct <- 100 * prop_sex[, "1"]
+cat("\n% Male among Included =", round(male_pct["TRUE"], 1),
+    "; % Male among Excluded =", round(male_pct["FALSE"], 1), "\n")
 
 # -------------------------------------------------------------------
 # STEP 5: CLASSIFIER ANALYSES (Reviewer Points 6 & 7)
@@ -674,12 +913,6 @@ cat("STEP 6: Complete.\n\n")
 
 
 
-
-
-
-
-
-
 # -------------------------------------------------------------------
 # STEP 7: PERMUTATION TESTS FOR GLOBAL STRENGTH (ΔS) AND STRUCTURE (M)
 # -------------------------------------------------------------------
@@ -833,10 +1066,71 @@ print(results_df, digits = 6)
 cat("\nSTEP 7: Complete.\n\n")
 
 
+library(NetworkComparisonTest)
+
+cat("\n--- RUNNING NCT WITH HIGH PERMUTATIONS (Reviewer 3 Fix) ---\n")
+cat("Note: This will take time (approx 1-2 hours)...\n")
+
+# Prepare data for 2022 (Example - repeat for 2023/2024 if needed)
+df_2022 <- FINAL_ANALYSIS_DATASET %>% filter(Year == "2022")
+df_2022_LS   <- df_2022 %>% filter(Profile == 2) %>% select(all_of(domain_cols))
+df_2022_Elev <- df_2022 %>% filter(Profile == 1) %>% select(all_of(domain_cols))
+
+# Run NCT with 50,000 permutations
+# This fixes the "p=0.007 floor" issue
+nct_2022 <- NCT(
+  df_2022_LS, 
+  df_2022_Elev, 
+  it = 50000,          # <--- High iterations
+  test.edges = TRUE, 
+  edges = "all",
+  progressbar = TRUE
+)
+
+# PRINT THE NEW P-VALUES
+cat("\nCorrected Edge P-values for 2022:\n")
+print(nct_2022$einv.pvals) 
+
+# SAVE the result so you don't lose it
+saveRDS(nct_2022, "NCT_2022_50k_Results.rds")
 
 
+library(NetworkComparisonTest)
 
+# --- RUNNING 2023 ---
+cat("\n--- RUNNING NCT FOR 2023 (50k Permutations) ---\n")
+df_2023 <- FINAL_ANALYSIS_DATASET %>% filter(Year == "2023")
+df_2023_LS   <- df_2023 %>% filter(Profile == 2) %>% select(all_of(domain_cols))
+df_2023_Elev <- df_2023 %>% filter(Profile == 1) %>% select(all_of(domain_cols))
 
+nct_2023 <- NCT(
+  df_2023_LS, df_2023_Elev, 
+  it = 50000, test.edges = TRUE, edges = "all", progressbar = TRUE
+)
+saveRDS(nct_2023, "NCT_2023_50k_Results.rds")
+
+# --- RUNNING 2024 ---
+cat("\n--- RUNNING NCT FOR 2024 (50k Permutations) ---\n")
+df_2024 <- FINAL_ANALYSIS_DATASET %>% filter(Year == "2024")
+df_2024_LS   <- df_2024 %>% filter(Profile == 2) %>% select(all_of(domain_cols))
+df_2024_Elev <- df_2024 %>% filter(Profile == 1) %>% select(all_of(domain_cols))
+
+nct_2024 <- NCT(
+  df_2024_LS, df_2024_Elev, 
+  it = 50000, test.edges = TRUE, edges = "all", progressbar = TRUE
+)
+saveRDS(nct_2024, "NCT_2024_50k_Results.rds")
+
+# --- PRINT ALL RESULTS FOR TABLE S5 ---
+cat("\n--- FINAL P-VALUES FOR TABLE S5 ---\n")
+cat("2022 Results (Already Run):\n")
+print(nct_2022$einv.pvals)
+
+cat("\n2023 Results:\n")
+print(nct_2023$einv.pvals)
+
+cat("\n2024 Results:\n")
+print(nct_2024$einv.pvals)
 
 
 library(tidyverse)
